@@ -30,6 +30,8 @@ namespace BetterTransitView.Systems
         private ValueBinding<bool> showWaitingPassengersBinding;
         private ValueBinding<bool> showTransitVehiclesBinding;
         private ValueBinding<bool> showInfoviewBackgroundBinding;
+        private ValueBinding<int> selectedTransitLineBinding;
+        private ValueBinding<bool> isMapPickerActiveBinding;
 
         // Queries & Entities
         private EntityQuery m_TransitLinesQuery;
@@ -43,11 +45,14 @@ namespace BetterTransitView.Systems
         private string m_ActiveTransitMode = "none";
         private string m_PendingTransitMode = "none";
         private bool m_ModeChangeRequested = false;
+        private bool m_IsMapPickerActive = false;
         private int m_TransitUpdateFrame = 0;
         private bool m_TransitLinesDirty = false;
         private bool m_WasToggleKeyDown = false;
         private int m_EnforceInfoviewFrames = 0;
         private Game.Tools.ToolBaseSystem m_LastActiveTool;
+        private bool m_HasInitializedDefaults = false;
+        private HashSet<Entity> m_SavedHiddenRoutes = new HashSet<Entity>();
 
         // Public Statics for the Render Jobs
         public static HashSet<Entity> HiddenCustomRoutes = new HashSet<Entity>();
@@ -101,9 +106,12 @@ namespace BetterTransitView.Systems
             this.showTransitPanelBinding = new ValueBinding<bool>("BetterTransitView", "showTransitPanel", false);
             this.transitLinesDataBinding = new ValueBinding<string>("BetterTransitView", "transitLinesData", "[]");
             this.showStopsAndStationsBinding = new ValueBinding<bool>("BetterTransitView", "showStopsAndStations", true);
-            this.showInfoviewBackgroundBinding = new ValueBinding<bool>("BetterTransitView", "showInfoviewBackground", false);
+            ShowInfoviewBackground = BetterTransitView.ModSettings.ModSettings.Instance.MapModeActivatedByDefault;
+            this.showInfoviewBackgroundBinding = new ValueBinding<bool>("BetterTransitView", "showInfoviewBackground", ShowInfoviewBackground);
             this.showWaitingPassengersBinding = new ValueBinding<bool>("BetterTransitView", "showWaitingPassengers", ShowWaitingPassengers);
             this.showTransitVehiclesBinding = new ValueBinding<bool>("BetterTransitView", "showTransitVehicles", ShowTransitVehicles);
+            this.selectedTransitLineBinding = new ValueBinding<int>("BetterTransitView", "selectedTransitLine", 0);
+            this.isMapPickerActiveBinding = new ValueBinding<bool>("BetterTransitView", "isMapPickerActive", false);
             
             AddBinding(this.showTransitPanelBinding);
             AddBinding(this.transitLinesDataBinding);
@@ -111,6 +119,8 @@ namespace BetterTransitView.Systems
             AddBinding(this.showWaitingPassengersBinding);
             AddBinding(this.showTransitVehiclesBinding);
             AddBinding(this.showInfoviewBackgroundBinding);
+            AddBinding(this.selectedTransitLineBinding);
+            AddBinding(this.isMapPickerActiveBinding);
 
             // Mock data for initial UI render safety
             this.transitLinesDataBinding.Update("[]");
@@ -220,6 +230,17 @@ namespace BetterTransitView.Systems
                     }
                 }
             }));
+
+            AddBinding(new TriggerBinding<bool>("BetterTransitView", "toggleMapPicker", (active) => {
+                m_IsMapPickerActive = active;
+                this.isMapPickerActiveBinding.Update(active);
+                if (active) m_ToolSystem.activeTool = World.GetOrCreateSystemManaged<BetterTransitViewPickerToolSystem>();
+                else m_ToolSystem.activeTool = World.GetOrCreateSystemManaged<Game.Tools.DefaultToolSystem>();
+            }));
+
+            AddBinding(new TriggerBinding("BetterTransitView", "resetSelectedTransitLine", () => {
+                this.selectedTransitLineBinding.Update(0);
+            }));
         }
 
         protected override string group => "BetterTransitView.Systems.TransitUISystem";
@@ -227,6 +248,23 @@ namespace BetterTransitView.Systems
         protected override void OnProcess() { }
         public override void OnWriteProperties(IJsonWriter writer) { }
 
+        public void CancelMapPicker()
+        {
+            m_IsMapPickerActive = false;
+            this.isMapPickerActiveBinding.Update(false);
+        }
+
+        public void OnPickerClicked(Unity.Mathematics.float3 hitPos)
+        {
+            int closestLine = FindClosestRouteTo(hitPos);
+            if (closestLine != 0)
+            {
+                this.selectedTransitLineBinding.Update(closestLine);
+                // Do not update to 0 here! JS will update it back to 0 once it receives the value.
+            }
+            m_IsMapPickerActive = false;
+            this.isMapPickerActiveBinding.Update(false);
+        }
         
         protected override void OnUpdate()
         {
@@ -322,6 +360,119 @@ namespace BetterTransitView.Systems
             base.OnUpdate();
         }
 
+        private int FindClosestRouteTo(Unity.Mathematics.float3 hitPos)
+        {
+            float minDistanceSq = float.MaxValue;
+            int closestRouteIndex = 0;
+
+            var segmentToRouteMap = new Unity.Collections.NativeParallelMultiHashMap<Entity, Entity>(200000, Unity.Collections.Allocator.Temp);
+            using var routeEntities = m_TransitLinesQuery.ToEntityArray(Unity.Collections.Allocator.Temp);
+            
+            var segmentBufferLookup = GetBufferLookup<Game.Routes.RouteSegment>(true);
+            var pathElementLookup = GetBufferLookup<Game.Pathfind.PathElement>(true);
+            var curveLookup = GetComponentLookup<Game.Net.Curve>(true);
+
+            // Build map
+            foreach (var routeEntity in routeEntities)
+            {
+                if (HiddenCustomRoutes.Contains(routeEntity)) continue;
+                if (segmentBufferLookup.TryGetBuffer(routeEntity, out var segments))
+                {
+                    foreach (var segment in segments)
+                    {
+                        if (pathElementLookup.TryGetBuffer(segment.m_Segment, out var path))
+                        {
+                            foreach (var element in path) segmentToRouteMap.Add(element.m_Target, routeEntity);
+                        }
+                    }
+                }
+            }
+
+            var cameraUpdateSystem = World.GetExistingSystemManaged<Game.Rendering.CameraUpdateSystem>();
+            float zoomLevel = cameraUpdateSystem != null ? cameraUpdateSystem.zoom : 5000f;
+            float normalizedZoom = Unity.Mathematics.math.clamp((zoomLevel - 1600f) / (10000f - 1600f), 0f, 1f);
+            float thickness = Unity.Mathematics.math.lerp(4.0f, 4.0f * 12f, normalizedZoom);
+            float ribbonWidth = thickness * 0.85f;
+
+            foreach (var routeEntity in routeEntities)
+            {
+                if (HiddenCustomRoutes.Contains(routeEntity)) continue;
+                if (segmentBufferLookup.TryGetBuffer(routeEntity, out var segments))
+                {
+                    foreach (var segment in segments)
+                    {
+                        if (pathElementLookup.TryGetBuffer(segment.m_Segment, out var path))
+                        {
+                            foreach (var element in path)
+                            {
+                                if (curveLookup.TryGetComponent(element.m_Target, out var curveComponent))
+                                {
+                                    var myCurve = curveComponent.m_Bezier;
+                                    var uniqueRoutes = new Unity.Collections.NativeList<Entity>(16, Unity.Collections.Allocator.Temp);
+                                    if (segmentToRouteMap.TryGetFirstValue(element.m_Target, out Entity routeOnSegment, out var iterator))
+                                    {
+                                        do
+                                        {
+                                            if (!uniqueRoutes.Contains(routeOnSegment)) uniqueRoutes.Add(routeOnSegment);
+                                        } while (segmentToRouteMap.TryGetNextValue(out routeOnSegment, ref iterator));
+                                    }
+
+                                    int totalLines = uniqueRoutes.Length;
+                                    float scaleFactor = 1.0f;
+                                    if (totalLines > 1) scaleFactor = Unity.Mathematics.math.max(0.35f, 1.0f - ((totalLines - 1) * 0.30f));
+                                    float currentRibbonWidth = ribbonWidth * scaleFactor;
+
+                                    if (totalLines > 1)
+                                    {
+                                        int myIndex = 0;
+                                        for (int u = 0; u < totalLines; u++)
+                                        {
+                                            if (uniqueRoutes[u].Index < routeEntity.Index) myIndex++;
+                                        }
+                                        float offsetAmount = (myIndex - (totalLines - 1) / 2f) * currentRibbonWidth;
+                                        var tangentA = Colossal.Mathematics.MathUtils.Tangent(myCurve, 0f);
+                                        var tangentD = Colossal.Mathematics.MathUtils.Tangent(myCurve, 1f);
+                                        var up = new Unity.Mathematics.float3(0, 1, 0);
+                                        var rightA = Unity.Mathematics.math.normalizesafe(Unity.Mathematics.math.cross(up, tangentA));
+                                        var rightD = Unity.Mathematics.math.normalizesafe(Unity.Mathematics.math.cross(up, tangentD));
+                                        var rightMid = Unity.Mathematics.math.normalizesafe(rightA + rightD);
+
+                                        myCurve.a += rightA * offsetAmount;
+                                        myCurve.b += rightMid * offsetAmount;
+                                        myCurve.c += rightMid * offsetAmount;
+                                        myCurve.d += rightD * offsetAmount;
+                                    }
+                                    uniqueRoutes.Dispose();
+
+                                    // Check distance
+                                    for (float t = 0f; t <= 1.0f; t += 0.1f)
+                                    {
+                                        var pt = Colossal.Mathematics.MathUtils.Position(myCurve, t);
+                                        // Ignore Y axis so hit detects correctly even if terrain is lower
+                                        float distSq = Unity.Mathematics.math.distancesq(new Unity.Mathematics.float2(hitPos.x, hitPos.z), new Unity.Mathematics.float2(pt.x, pt.z));
+                                        if (distSq < minDistanceSq)
+                                        {
+                                            minDistanceSq = distSq;
+                                            closestRouteIndex = routeEntity.Index;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            segmentToRouteMap.Dispose();
+            
+            // Threshold: Ribbon max thickness is ~48, so we check distance up to ~50 meters
+            if (minDistanceSq <= 2500f)
+            {
+                return closestRouteIndex;
+            }
+            return 0;
+        }
+
         
         private void UpdateTransitLinesData()
         {
@@ -378,7 +529,12 @@ namespace BetterTransitView.Systems
                 
                 int cargo = 0;
                 int capacity = 0;
+                
+                var transportLine = EntityManager.GetComponentData<Game.Routes.TransportLine>(entity);
+                bool isDispatching = (transportLine.m_Flags & Game.Routes.TransportLineFlags.RequireVehicles) != 0;
+                bool hasShortage = (transportLine.m_Flags & Game.Routes.TransportLineFlags.NotEnoughVehicles) != 0;
                 int vehicles = TransportUIUtils.GetRouteVehiclesCount(EntityManager, entity, ref cargo, ref capacity);
+                
                 int usage = capacity > 0 ? UnityEngine.Mathf.RoundToInt(((float)cargo / capacity) * 100) : 0;
                 
                 float length = TransportUIUtils.GetRouteLength(EntityManager, entity);
@@ -401,7 +557,7 @@ namespace BetterTransitView.Systems
 
                 if (!first) result.Append(",");
                 string safeName = name?.Replace("\"", "\\\"") ?? "Unnamed Route";
-                result.Append($@"{{""id"": {entity.Index}, ""type"": ""{type}"", ""name"": ""{safeName}"", ""color"": ""{colorHex}"", ""vehicles"": {vehicles}, ""passengers"": {cargo}, ""length"": ""{lengthStr}"", ""lengthRaw"": {length.ToString(System.Globalization.CultureInfo.InvariantCulture)}, ""usage"": {usage}, ""cargo"": {isCargo.ToString().ToLower()}, ""visible"": {isVisible.ToString().ToLower()}, ""stops"": {stops} }}");
+                result.Append($@"{{""id"": {entity.Index}, ""type"": ""{type}"", ""name"": ""{safeName}"", ""color"": ""{colorHex}"", ""vehicles"": {vehicles}, ""isDispatching"": {isDispatching.ToString().ToLower()}, ""hasShortage"": {hasShortage.ToString().ToLower()}, ""passengers"": {cargo}, ""length"": ""{lengthStr}"", ""lengthRaw"": {length.ToString(System.Globalization.CultureInfo.InvariantCulture)}, ""usage"": {usage}, ""cargo"": {isCargo.ToString().ToLower()}, ""visible"": {isVisible.ToString().ToLower()}, ""stops"": {stops} }}");
                 
                 first = false;
             }
@@ -416,16 +572,48 @@ namespace BetterTransitView.Systems
             this.showTransitPanelBinding.Update(true);
             
             HiddenCustomRoutes.Clear();
-            using var entities = m_TransitLinesQuery.ToEntityArray(Unity.Collections.Allocator.Temp);
-            foreach(var e in entities) {
-                if (!EntityManager.HasComponent<Game.Prefabs.PrefabRef>(e)) continue;
-                var prefabRef = EntityManager.GetComponentData<Game.Prefabs.PrefabRef>(e);
-                if (EntityManager.TryGetComponent<Game.Prefabs.TransportLineData>(prefabRef.m_Prefab, out var lineData)) {
-                    // Hide Cargo AND Airplanes by default
-                    if (lineData.m_CargoTransport || lineData.m_TransportType == Game.Prefabs.TransportType.Airplane) {
-                        HiddenCustomRoutes.Add(e);
+
+            if (m_HasInitializedDefaults)
+            {
+                foreach (var e in m_SavedHiddenRoutes) HiddenCustomRoutes.Add(e);
+            }
+            else
+            {
+                using var entities = m_TransitLinesQuery.ToEntityArray(Unity.Collections.Allocator.Temp);
+                foreach(var e in entities) {
+                    if (!EntityManager.HasComponent<Game.Prefabs.PrefabRef>(e)) continue;
+                    var prefabRef = EntityManager.GetComponentData<Game.Prefabs.PrefabRef>(e);
+                    if (EntityManager.TryGetComponent<Game.Prefabs.TransportLineData>(prefabRef.m_Prefab, out var lineData)) {
+                        if (lineData.m_CargoTransport) {
+                            if (!BetterTransitView.ModSettings.ModSettings.Instance.DefaultCargoVisible) {
+                                HiddenCustomRoutes.Add(e);
+                            }
+                        } else {
+                            switch (lineData.m_TransportType) {
+                                case Game.Prefabs.TransportType.Bus:
+                                    if (!BetterTransitView.ModSettings.ModSettings.Instance.DefaultBusVisible) HiddenCustomRoutes.Add(e);
+                                    break;
+                                case Game.Prefabs.TransportType.Train:
+                                    if (!BetterTransitView.ModSettings.ModSettings.Instance.DefaultTrainVisible) HiddenCustomRoutes.Add(e);
+                                    break;
+                                case Game.Prefabs.TransportType.Tram:
+                                    if (!BetterTransitView.ModSettings.ModSettings.Instance.DefaultTramVisible) HiddenCustomRoutes.Add(e);
+                                    break;
+                                case Game.Prefabs.TransportType.Subway:
+                                    if (!BetterTransitView.ModSettings.ModSettings.Instance.DefaultSubwayVisible) HiddenCustomRoutes.Add(e);
+                                    break;
+                                case Game.Prefabs.TransportType.Ship:
+                                case Game.Prefabs.TransportType.Ferry:
+                                    if (!BetterTransitView.ModSettings.ModSettings.Instance.DefaultShipVisible) HiddenCustomRoutes.Add(e);
+                                    break;
+                                case Game.Prefabs.TransportType.Airplane:
+                                    if (!BetterTransitView.ModSettings.ModSettings.Instance.DefaultAirplaneVisible) HiddenCustomRoutes.Add(e);
+                                    break;
+                            }
+                        }
                     }
                 }
+                m_HasInitializedDefaults = true;
             }
 
             UpdateTransitLinesData(); 
@@ -443,6 +631,10 @@ namespace BetterTransitView.Systems
             m_ActiveTransitMode = "none";
             this.showTransitPanelBinding.Update(false);
             m_InfoviewsUISystem.SetActiveInfoview(Entity.Null);
+            
+            m_SavedHiddenRoutes.Clear();
+            foreach (var e in HiddenCustomRoutes) m_SavedHiddenRoutes.Add(e);
+            
             HiddenCustomRoutes.Clear();
             SyncVanillaVisibilityToUI();
         }
