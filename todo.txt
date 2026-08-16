@@ -1,1 +1,5 @@
-﻿- show day/night route icons
+﻿
+
+esc to close, if last open screen
+
+show day/night route icons

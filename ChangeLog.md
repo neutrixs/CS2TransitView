@@ -1,2 +1,3 @@
-- Added a scrollbar.
-- Better compatibility with the Realistic Trips mod.
+- You can now expand transit lines to view their stops. Each stop will show connecting lines, nearby stops of any type, and waiting passenger info.
+- Added Busiest Stops list (click the hourglass icon).
+- Fixed picker tool not scrolling to the identified transit line.
